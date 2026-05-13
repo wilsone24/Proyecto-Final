@@ -185,3 +185,4 @@ try:
  
 except Exception as e:
     raise Exception(f"[Table Properties] Failed to apply properties on {FULL_TARGET}: {e}")
+
