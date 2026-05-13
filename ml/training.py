@@ -140,7 +140,7 @@ with mlflow.start_run(run_name="xgboost_cardiovascular_v1") as run:
     
     mlflow.xgboost.log_model(
         model,
-        artifact_path="model",
+        name="model",
         signature=signature,
         input_example=X_train.iloc[:5],
         registered_model_name="pf1.models.xgboost_cardio"
