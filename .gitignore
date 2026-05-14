@@ -1,0 +1,24 @@
+# Local config
+local/
+
+# Virtual environments
+venv/
+.venv/
+
+# MLflow local runs
+mlruns/
+mlrun/
+*.db
+
+# Local Delta tables
+data/silver_delta/
+data/gold_delta/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Raw data (keep only .gitkeep)
+data/*.csv
+data/*.parquet
