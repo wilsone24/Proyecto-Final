@@ -1,6 +1,6 @@
 -- Databricks notebook source
 -- DBTITLE 1,Catalog
-USE CATALOG pf1;
+USE CATALOG databricks_service_pf;
 
 -- COMMAND ----------
 
