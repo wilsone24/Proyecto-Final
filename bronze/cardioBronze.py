@@ -4,7 +4,7 @@
 # environment_version = "5"
 # ///
 # DBTITLE 1,Enviroment
-spark.sql("USE CATALOG `pf1`")
+spark.sql("USE CATALOG `databricks_service_pf`")
 
 # COMMAND ----------
 
@@ -15,7 +15,8 @@ from datetime import datetime
 
 # COMMAND ----------
 
-dbutils.widgets.text("source_path", "")
+# DBTITLE 1,Parameters
+dbutils.widgets.text("source_path", "")  
 dbutils.widgets.text("schema_name", "")
 dbutils.widgets.text("table_name", "")
 
@@ -48,6 +49,7 @@ schema = StructType(
 
 # COMMAND ----------
 
+# DBTITLE 1,Metadata
 column_comments = {
     "id": "Unique patient identifier in the original dataset.",
     "age": "Patient age in days.",
@@ -116,6 +118,7 @@ except Exception as e:
 
 # COMMAND ----------
 
+# DBTITLE 1,Rows Validation
 actual_rows = spark.table(FULL_TABLE).count()
 
 if actual_rows != EXPECTED_ROWS:
@@ -125,6 +128,7 @@ if actual_rows != EXPECTED_ROWS:
 
 # COMMAND ----------
 
+# DBTITLE 1,Add metadata to the table
 try:
     for column, comment in column_comments.items():
         spark.sql(

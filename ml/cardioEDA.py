@@ -13,7 +13,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Catalog
-spark.sql("USE CATALOG `pf1`")
+spark.sql("USE CATALOG `databricks_service_pf`")
 
 # COMMAND ----------
 
