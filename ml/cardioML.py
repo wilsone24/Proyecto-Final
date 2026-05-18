@@ -800,6 +800,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Log run, register and set @candidate
+# DBTITLE 1,Log run, register and set @candidate
 try:
     with mlflow.start_run(run_name=f"cardio_training_{WINNER_ALGORITHM.lower()}") as run:
         # Tags
@@ -841,13 +842,20 @@ try:
         mlflow.log_metric("cv_tuned_rf_mean",     cv_tuned_rf_mean)
         mlflow.log_metric("cv_tuned_rf_std",      cv_tuned_rf_std)
 
-        # Artifacts
-        mlflow.log_figure(fig_threshold,      "plots/threshold_sweep.png")
-        mlflow.log_figure(fig_cm,             "plots/confusion_matrix.png")
-        mlflow.log_figure(fig_curves,         "plots/roc_pr_curves.png")
-        mlflow.log_figure(fig_fi,             "plots/feature_importance.png")
-        mlflow.log_figure(fig_shap_summary,   "plots/shap_summary.png")
-        for i, fig_local in enumerate(local_figs):
+        # Artifacts — log only the figures that were successfully created.
+        # Any optional step (e.g. SHAP) that failed earlier won't block registration.
+        _optional_figures = {
+            "plots/threshold_sweep.png":    globals().get("fig_threshold"),
+            "plots/confusion_matrix.png":   globals().get("fig_cm"),
+            "plots/roc_pr_curves.png":      globals().get("fig_curves"),
+            "plots/feature_importance.png": globals().get("fig_fi"),
+            "plots/shap_summary.png":       globals().get("fig_shap_summary"),
+        }
+        for path, fig in _optional_figures.items():
+            if fig is not None:
+                mlflow.log_figure(fig, path)
+
+        for i, fig_local in enumerate(globals().get("local_figs", []) or []):
             mlflow.log_figure(fig_local, f"plots/shap_local_patient_{i+1}.png")
 
         comparison_df.to_csv("/tmp/cv_comparison.csv", index=False)

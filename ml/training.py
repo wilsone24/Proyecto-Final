@@ -3,14 +3,14 @@
 # [tool.databricks.environment]
 # environment_version = "5"
 # ///
-spark.sql(f"USE CATALOG `pf1`")
+spark.sql(f"USE CATALOG `databricks_service_pf`")
 
 # COMMAND ----------
 
 # DBTITLE 1,Import libraries
 import mlflow
-import mlflow.xgboost
-import xgboost as xgb
+import mlflow.xgboost as xgb
+# import xgboost as xgb
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split, cross_val_score
@@ -28,8 +28,45 @@ from sklearn.metrics import (
 # COMMAND ----------
 
 # DBTITLE 1,Data preparation
-# ── Read Gold feature table and convert to pandas ───────────────────────────
-pdf = spark.table("gold.cardiofeatures").toPandas()
+# ── Read Bronze table and engineer features ─────────────────────────────────
+from pyspark.sql import functions as F
+
+raw_df = spark.table("databricks_service_pf.bronze.cardiobronze")
+
+# Feature engineering (replicates gold.cardiofeatures logic)
+# Compute derived columns first, then rename
+features_df = (
+    raw_df
+    .withColumn("age_years", (F.col("age") / 365.25).cast("int"))
+    .withColumn("age_group_id",
+        F.when(F.col("age") / 365.25 < 30, 1)
+         .when(F.col("age") / 365.25 < 45, 2)
+         .when(F.col("age") / 365.25 < 60, 3)
+         .when(F.col("age") / 365.25 < 75, 4)
+         .otherwise(5)
+    )
+    .withColumn("bmi", F.round(F.col("weight") / F.pow(F.col("height") / 100, 2), 2))
+    .withColumn("pulse_pressure", F.col("ap_hi") - F.col("ap_lo"))
+    .withColumn("hypertension",
+        F.when((F.col("ap_hi") >= 140) | (F.col("ap_lo") >= 90), 1).otherwise(0)
+    )
+    .withColumnRenamed("height", "height_cm")
+    .withColumnRenamed("weight", "weight_kg")
+    .withColumnRenamed("ap_hi", "systolic_bp")
+    .withColumnRenamed("ap_lo", "diastolic_bp")
+    .withColumnRenamed("smoke", "is_smoker")
+    .withColumnRenamed("alco", "drinks_alcohol")
+    .withColumnRenamed("active", "is_physically_active")
+)
+
+pdf = features_df.select(
+    "age_years", "age_group_id", "gender",
+    "height_cm", "weight_kg", "bmi",
+    "systolic_bp", "diastolic_bp", "pulse_pressure",
+    "hypertension", "cholesterol", "gluc",
+    "is_smoker", "drinks_alcohol", "is_physically_active",
+    "cardio"
+).toPandas()
 
 FEATURES = [
     "age_years", "age_group_id", "gender",
@@ -76,16 +113,10 @@ with mlflow.start_run(run_name="xgboost_cardiovascular_v1") as run:
     # --- Tags descriptivos ---
     mlflow.set_tags({
         "dataset":   "ocgn_cardio_train",
-        "source":    "gold.cardiofeatures",
+        "source":    "databricks_service_pf.bronze.cardiobronze",
         "modelo":    "XGBoost",
         "version":   "1.0",
     })
-
-    # --- Log de parámetros, no necesario con autolog ---
-    # mlflow.log_params(params)
-    # mlflow.log_param("features_count", len(FEATURES))
-    # mlflow.log_param("train_size", len(X_train))
-    # mlflow.log_param("test_size", len(X_test))
 
     # --- Entrenamiento ---
     model = xgb.XGBClassifier(**params)
