@@ -515,3 +515,4 @@ if should_promote:
     print(f"  champion version (v{candidate_meta['version']}).")
 else:
     print(f"  No action needed. The serving endpoint already serves the active champion.")
+

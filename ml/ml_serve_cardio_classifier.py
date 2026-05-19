@@ -384,3 +384,4 @@ print("NEXT STEPS:")
 print(f"  - Open Catalog Explorer → {REGISTERED_MODEL_NAME} → Serving tab to monitor.")
 print(f"  - When cardioML.py promotes a new @champion, re-run this notebook to update.")
 print(f"  - For demo: copy the curl snippet above and run it from any terminal.")
+
