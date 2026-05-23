@@ -1,0 +1,12 @@
+bundle:
+  name: proyecto-final
+
+include:
+  - resources/*.yml
+
+targets:
+  prod:
+    mode: production
+    default: true
+    workspace:
+      host: https://adb-7405609053978389.9.azuredatabricks.net

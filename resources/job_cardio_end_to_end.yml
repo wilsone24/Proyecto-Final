@@ -1,0 +1,26 @@
+resources:
+  jobs:
+    cardio_end_to_end:
+      name: cardio_end_to_end
+      queue: { enabled: true }
+      email_notifications:
+        on_start:
+          - wilsone@uninorte.edu.co
+          - eradaa@uninorte.edu.co
+          - amyespes@uninorte.edu.co
+        on_failure:
+          - wilsone@uninorte.edu.co
+          - eradaa@uninorte.edu.co
+          - amyespes@uninorte.edu.co
+      schedule:
+        quartz_cron_expression: 16 30 9 * * ?
+        timezone_id: America/Bogota
+        pause_status: PAUSED
+      tasks:
+        - task_key: cardio_data_pipeline
+          run_job_task:
+            job_id: ${resources.jobs.cardio_data_pipeline.id}
+        - task_key: cardio_ml_pipeline
+          depends_on: [{ task_key: cardio_data_pipeline }]
+          run_job_task:
+            job_id: ${resources.jobs.cardio_ml_pipeline.id}

@@ -1,0 +1,87 @@
+resources:
+  jobs:
+    cardio_data_pipeline:
+      name: cardio_data_pipeline
+      queue: { enabled: true }
+      tasks:
+        - task_key: ingest_cardio_patients
+          existing_cluster_id: ${resources.clusters.final_project_cluster.id}
+          max_retries: 1
+          min_retry_interval_millis: 300000
+          notebook_task:
+            notebook_path: ../notebooks/bronze/ingest_cardio_patients.py
+            base_parameters:
+              source_path: /Volumes/databricks_service_pf/bronze/dataset/cardio_train.csv
+              schema_name: bronze
+              table_name: raw_kaggle__cardio_patients
+
+        - task_key: clean_cardio_patients
+          depends_on: [{ task_key: ingest_cardio_patients }]
+          existing_cluster_id: ${resources.clusters.final_project_cluster.id}
+          max_retries: 1
+          min_retry_interval_millis: 300000
+          notebook_task:
+            notebook_path: ../notebooks/silver/clean_cardio_patients.py
+            base_parameters:
+              source_schema: bronze
+              source_table: raw_kaggle__cardio_patients
+              target_schema: silver
+              target_table: cardio_patients
+
+        - task_key: fct_cardio_outcomes
+          depends_on: [{ task_key: clean_cardio_patients }]
+          existing_cluster_id: ${resources.clusters.final_project_cluster.id}
+          max_retries: 1
+          min_retry_interval_millis: 300000
+          notebook_task:
+            notebook_path: ../notebooks/gold/fct_cardio_outcomes.py
+            base_parameters:
+              source_schema: silver
+              source_table: cardio_patients
+              target_schema: gold
+              target_table: fct_cardio_outcomes
+
+        - task_key: cardio_features
+          depends_on: [{ task_key: fct_cardio_outcomes }]
+          existing_cluster_id: ${resources.clusters.final_project_cluster.id}
+          max_retries: 1
+          min_retry_interval_millis: 300000
+          notebook_task:
+            notebook_path: ../notebooks/gold/cardio_features.py
+            base_parameters:
+              source_schema: gold
+              source_table: fct_cardio_outcomes
+              target_schema: gold
+              target_table: cardio_features
+
+        - task_key: dim_age_group
+          depends_on: [{ task_key: fct_cardio_outcomes }]
+          existing_cluster_id: ${resources.clusters.final_project_cluster.id}
+          max_retries: 1
+          min_retry_interval_millis: 300000
+          notebook_task:
+            notebook_path: ../notebooks/gold/dim_age_group.py
+
+        - task_key: dim_cholesterol
+          depends_on: [{ task_key: fct_cardio_outcomes }]
+          existing_cluster_id: ${resources.clusters.final_project_cluster.id}
+          max_retries: 1
+          min_retry_interval_millis: 300000
+          notebook_task:
+            notebook_path: ../notebooks/gold/dim_cholesterol.py
+
+        - task_key: dim_gender
+          depends_on: [{ task_key: fct_cardio_outcomes }]
+          existing_cluster_id: ${resources.clusters.final_project_cluster.id}
+          max_retries: 1
+          min_retry_interval_millis: 300000
+          notebook_task:
+            notebook_path: ../notebooks/gold/dim_gender.py
+
+        - task_key: dim_glucose
+          depends_on: [{ task_key: fct_cardio_outcomes }]
+          existing_cluster_id: ${resources.clusters.final_project_cluster.id}
+          max_retries: 1
+          min_retry_interval_millis: 300000
+          notebook_task:
+            notebook_path: ../notebooks/gold/dim_glucose.py

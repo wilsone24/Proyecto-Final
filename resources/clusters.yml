@@ -1,0 +1,15 @@
+resources:
+  clusters:
+    final_project_cluster:
+      cluster_name: FinalProjectCluster
+      spark_version: 17.3.x-cpu-ml-scala2.13
+      node_type_id: Standard_DC4as_v5
+      autotermination_minutes: 30
+      data_security_mode: SINGLE_USER
+      single_user_name: wilsone@uninorte.edu.co
+      num_workers: 0
+      spark_conf:
+        spark.databricks.cluster.profile: singleNode
+        spark.master: "local[*]"
+      custom_tags:
+        ResourceClass: SingleNode

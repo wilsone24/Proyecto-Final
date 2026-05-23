@@ -1,0 +1,44 @@
+resources:
+  jobs:
+    cardio_ml_pipeline:
+      name: cardio_ml_pipeline
+      queue: { enabled: true }
+      tasks:
+        - task_key: ml_train_cardio_classifier
+          existing_cluster_id: ${resources.clusters.final_project_cluster.id}
+          max_retries: 1
+          min_retry_interval_millis: 300000
+          notebook_task:
+            notebook_path: ../notebooks/ml/ml_train_cardio_classifier.py
+            base_parameters:
+              source_schema: gold
+              source_table: cardio_features
+              target_column: cardio
+              registered_model_name: databricks_service_pf.gold.cardio_classifier
+              mlflow_experiment_path: /Shared/cardio_ml
+
+        - task_key: ml_promote_cardio_classifier
+          depends_on: [{ task_key: ml_train_cardio_classifier }]
+          existing_cluster_id: ${resources.clusters.final_project_cluster.id}
+          max_retries: 1
+          min_retry_interval_millis: 300000
+          notebook_task:
+            notebook_path: ../notebooks/ml/ml_promote_cardio_classifier.py
+            base_parameters:
+              registered_model_name: databricks_service_pf.gold.cardio_classifier
+              mlflow_experiment_path: /Shared/cardio_ml
+
+        - task_key: ml_serve_cardio_classifier
+          depends_on: [{ task_key: ml_promote_cardio_classifier }]
+          existing_cluster_id: ${resources.clusters.final_project_cluster.id}
+          max_retries: 1
+          min_retry_interval_millis: 300000
+          notebook_task:
+            notebook_path: ../notebooks/ml/ml_serve_cardio_classifier.py
+            base_parameters:
+              source_schema: gold
+              source_table: cardio_features
+              registered_model_name: databricks_service_pf.gold.cardio_classifier
+              endpoint_name: cardio-classifier-endpoint
+              workload_size: Small
+              scale_to_zero: "true"
