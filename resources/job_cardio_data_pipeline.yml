@@ -60,7 +60,7 @@ resources:
           max_retries: 1
           min_retry_interval_millis: 300000
           notebook_task:
-            notebook_path: ../notebooks/gold/dim_age_group.py
+            notebook_path: ../notebooks/gold/dim_age_group.sql
 
         - task_key: dim_cholesterol
           depends_on: [{ task_key: fct_cardio_outcomes }]
@@ -68,7 +68,7 @@ resources:
           max_retries: 1
           min_retry_interval_millis: 300000
           notebook_task:
-            notebook_path: ../notebooks/gold/dim_cholesterol.py
+            notebook_path: ../notebooks/gold/dim_cholesterol.sql
 
         - task_key: dim_gender
           depends_on: [{ task_key: fct_cardio_outcomes }]
@@ -76,7 +76,7 @@ resources:
           max_retries: 1
           min_retry_interval_millis: 300000
           notebook_task:
-            notebook_path: ../notebooks/gold/dim_gender.py
+            notebook_path: ../notebooks/gold/dim_gender.sql
 
         - task_key: dim_glucose
           depends_on: [{ task_key: fct_cardio_outcomes }]
@@ -84,4 +84,4 @@ resources:
           max_retries: 1
           min_retry_interval_millis: 300000
           notebook_task:
-            notebook_path: ../notebooks/gold/dim_glucose.py
+            notebook_path: ../notebooks/gold/dim_glucose.sql
