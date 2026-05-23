@@ -6,23 +6,18 @@
 # MAGIC %md
 # MAGIC # Cardiovascular Disease — ML Training Pipeline
 # MAGIC
-# MAGIC End-to-end binary classifier (XGBoost vs Random Forest) with hyperparameter
-# MAGIC tuning, threshold optimization and interpretability.
-# MAGIC
-# MAGIC On every run the winning model is registered to Unity Catalog and tagged
-# MAGIC with the `@candidate` alias. Promotion to `@champion` is decided in
-# MAGIC `cardioPromotion.py`, not here.
-# MAGIC
-# MAGIC **Source:** `databricks_service_pf.gold.cardiofeatures`  |  **Target:** `cardio`  |  **Pipeline version:** `1.0.0`
+# MAGIC Trains XGBoost vs Random Forest, picks the winner, registers it as `@candidate`.
 
 # COMMAND ----------
 
 # DBTITLE 1,Install dependencies
-# MAGIC %pip install xgboost optuna shap
+# Install ML libraries not available in the standard Databricks runtime.
+%pip install xgboost optuna shap
 
 # COMMAND ----------
 
 # DBTITLE 1,Restart Python
+# Restart the Python kernel so the freshly-installed libraries are picked up.
 dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -33,11 +28,13 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 # DBTITLE 1,Catalog
+# Set the active Unity Catalog for all subsequent table references.
 spark.sql("USE CATALOG `databricks_service_pf`")
 
 # COMMAND ----------
 
 # DBTITLE 1,Libraries
+# ML stack: sklearn for splits/metrics/RF, XGBoost, Optuna for tuning, SHAP for interpretability, MLflow for tracking.
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -77,21 +74,33 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 # COMMAND ----------
 
 # DBTITLE 1,Parameters
-dbutils.widgets.text("source_schema",          "gold")
-dbutils.widgets.text("source_table",           "cardiofeatures")
-dbutils.widgets.text("target_column",          "cardio")
-dbutils.widgets.text("registered_model_name",  "databricks_service_pf.gold.cardio_classifier")
+# Job-level inputs: source feature table, target column, registered model name and MLflow experiment.
+dbutils.widgets.text("source_schema", "gold")
+dbutils.widgets.text("source_table", "cardio_features")
+dbutils.widgets.text("target_column", "cardio")
+dbutils.widgets.text(
+    "registered_model_name", "databricks_service_pf.gold.cardio_classifier"
+)
 dbutils.widgets.text("mlflow_experiment_path", "/Shared/cardio_ml")
 
 # COMMAND ----------
 
-# DBTITLE 1,Variables
-# I/O parameters (from widgets) — values likely to change between environments / runs
+# DBTITLE 1,Constants
+# Validate widgets and derive runtime constants (I/O, split sizes, tuning budget, thresholds, SHAP config).
 SOURCE_SCHEMA          = dbutils.widgets.get("source_schema")
 SOURCE_TABLE           = dbutils.widgets.get("source_table")
 TARGET_COLUMN          = dbutils.widgets.get("target_column")
 REGISTERED_MODEL_NAME  = dbutils.widgets.get("registered_model_name")
 MLFLOW_EXPERIMENT_PATH = dbutils.widgets.get("mlflow_experiment_path")
+
+# Fail fast if any required widget was not provided
+if not all([SOURCE_SCHEMA, SOURCE_TABLE, TARGET_COLUMN, REGISTERED_MODEL_NAME, MLFLOW_EXPERIMENT_PATH]):
+    raise ValueError(
+        f"Missing required widgets: source_schema='{SOURCE_SCHEMA}', "
+        f"source_table='{SOURCE_TABLE}', target_column='{TARGET_COLUMN}', "
+        f"registered_model_name='{REGISTERED_MODEL_NAME}', "
+        f"mlflow_experiment_path='{MLFLOW_EXPERIMENT_PATH}'"
+    )
 
 # Registry conventions
 CANDIDATE_ALIAS = "candidate"
@@ -126,15 +135,15 @@ THRESHOLD_METRIC    = "f1"        # threshold optimization criterion
 THRESHOLD_GRID = np.arange(THRESHOLD_MIN, THRESHOLD_MAX + THRESHOLD_STEP, THRESHOLD_STEP)
 
 RUN_TAGS = {
-    "pipeline.version":     PIPELINE_VERSION,
-    "data.source":          FULL_SOURCE,
-    "data.layer":           "gold",
-    "data.subject":         "cardiovascular-disease",
-    "data.owner":           "data-engineering",
-    "data.purpose":         "ml-classifier",
-    "optimization.metric":  OPTIMIZATION_METRIC,
-    "threshold.metric":     THRESHOLD_METRIC,
-    "stage":                "training",
+    "pipeline.version":    PIPELINE_VERSION,
+    "data.source":         FULL_SOURCE,
+    "data.layer":          "gold",
+    "data.subject":        "cardiovascular-disease",
+    "data.owner":          "data-engineering",
+    "data.purpose":        "ml-classifier",
+    "optimization.metric": OPTIMIZATION_METRIC,
+    "threshold.metric":    THRESHOLD_METRIC,
+    "stage":               "training",
 }
 
 print(f"Source:                 {FULL_SOURCE}")
@@ -147,6 +156,7 @@ print(f"CV folds:               {CV_FOLDS}")
 # COMMAND ----------
 
 # DBTITLE 1,MLflow configuration
+# Point MLflow at the Unity Catalog model registry and the shared experiment path.
 try:
     mlflow.set_registry_uri("databricks-uc")
     mlflow.set_experiment(MLFLOW_EXPERIMENT_PATH)
@@ -160,8 +170,23 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Helper functions
-def compute_metrics(y_true, y_proba, threshold=0.5):
-    """Compute the full classification metric suite given probabilities and a threshold."""
+# Reusable utilities for metrics, cross-validation, threshold sweep and MLflow metric logging.
+def compute_metrics(
+    y_true: pd.Series,
+    y_proba: np.ndarray,
+    threshold: float = 0.5,
+) -> dict:
+    """Compute the full classification metric suite for binary classification.
+
+    Args:
+        y_true: Ground-truth binary labels (0/1).
+        y_proba: Predicted probabilities for the positive class.
+        threshold: Decision threshold used to derive binary predictions from probabilities.
+
+    Returns:
+        Dict with keys: accuracy, precision, recall, f1 (threshold-dependent),
+        roc_auc and pr_auc (threshold-independent).
+    """
     y_pred = (y_proba >= threshold).astype(int)
     return {
         "accuracy":  accuracy_score(y_true, y_pred),
@@ -173,14 +198,49 @@ def compute_metrics(y_true, y_proba, threshold=0.5):
     }
 
 
-def cv_evaluate(model, X, y, cv, scoring="roc_auc"):
-    """Run cross-validation and return (mean, std, raw_scores)."""
+def cv_evaluate(
+    model,
+    X: pd.DataFrame,
+    y: pd.Series,
+    cv,
+    scoring: str = "roc_auc",
+) -> tuple:
+    """Run cross-validation and return aggregated scores.
+
+    Args:
+        model: sklearn-compatible estimator.
+        X: Feature matrix.
+        y: Target vector.
+        cv: Cross-validation splitter (e.g. StratifiedKFold instance).
+        scoring: sklearn scoring string (e.g. "roc_auc", "f1").
+
+    Returns:
+        A (mean, std, raw_scores) tuple — mean and std as floats, raw_scores
+        as a numpy array of per-fold scores.
+    """
     scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=-1)
     return float(scores.mean()), float(scores.std()), scores
 
 
-def find_optimal_threshold(y_true, y_proba, thresholds, metric_fn=f1_score):
-    """Sweep thresholds and return (best_threshold, best_score, results_df)."""
+def find_optimal_threshold(
+    y_true: pd.Series,
+    y_proba: np.ndarray,
+    thresholds: np.ndarray,
+    metric_fn=f1_score,
+) -> tuple:
+    """Sweep decision thresholds and return the one that maximises `metric_fn`.
+
+    Args:
+        y_true: Ground-truth binary labels (0/1).
+        y_proba: Predicted probabilities for the positive class.
+        thresholds: Array of thresholds to evaluate (e.g. np.arange(0.1, 0.9, 0.01)).
+        metric_fn: sklearn metric callable to maximise (default f1_score).
+            Must accept y_true, y_pred and a zero_division kwarg.
+
+    Returns:
+        A (best_threshold, best_score, results_df) tuple. results_df has one
+        row per threshold with columns: threshold, score, precision, recall.
+    """
     rows = []
     for t in thresholds:
         y_pred = (y_proba >= t).astype(int)
@@ -191,12 +251,19 @@ def find_optimal_threshold(y_true, y_proba, thresholds, metric_fn=f1_score):
             "recall":    float(recall_score(y_true, y_pred, zero_division=0)),
         })
     results_df = pd.DataFrame(rows)
-    best_row = results_df.loc[results_df["score"].idxmax()]
+    best_row   = results_df.loc[results_df["score"].idxmax()]
     return float(best_row["threshold"]), float(best_row["score"]), results_df
 
 
-def log_metric_dict(metrics, prefix=""):
-    """Log a dictionary of metrics to MLflow with an optional prefix."""
+def log_metric_dict(metrics: dict, prefix: str = "") -> None:
+    """Log a dict of metrics to the active MLflow run with an optional prefix.
+
+    Args:
+        metrics: Mapping from metric name to numeric value.
+        prefix: Optional prefix prepended to every metric name (e.g. "test"
+            yields "test_accuracy", "test_f1", ...). Use an empty string to
+            log without a prefix.
+    """
     for name, value in metrics.items():
         key = f"{prefix}_{name}" if prefix else name
         mlflow.log_metric(key, float(value))
@@ -204,27 +271,47 @@ def log_metric_dict(metrics, prefix=""):
 # COMMAND ----------
 
 # DBTITLE 1,Custom pyfunc wrapper
+# Wrapper that embeds the optimal threshold so serving consumers don't need to know it.
 class CardioModel(mlflow.pyfunc.PythonModel):
+    """Custom MLflow pyfunc wrapper for the cardiovascular disease classifier.
+
+    Exposes a uniform predict() interface over any sklearn-compatible classifier
+    (XGBoost, Random Forest, ...). The optimal decision threshold is baked into
+    the model object so downstream consumers (Model Serving endpoints, batch
+    inference jobs, etc.) get binary predictions without having to know the
+    threshold externally.
+
+    Predict output is a DataFrame with two columns:
+        - probability: probability of CVD (positive class).
+        - prediction:  binary class derived from the embedded threshold.
     """
-    Wrapper that exposes a uniform predict() interface for any sklearn-compatible
-    classifier (XGBoost, Random Forest, ...).
 
-    Returns a DataFrame with two columns:
-        - probability: probability of CVD (positive class)
-        - prediction:  binary class using the embedded optimal threshold
+    def __init__(self, model, optimal_threshold: float):
+        """Initialise the wrapper with a fitted estimator and decision threshold.
 
-    The optimal threshold is baked into the model so serving consumers don't
-    need to know it externally.
-    """
-
-    def __init__(self, model, optimal_threshold):
+        Args:
+            model: A fitted sklearn-compatible classifier exposing predict_proba().
+            optimal_threshold: Decision threshold (between 0 and 1) used to derive
+                binary predictions from probabilities.
+        """
         self.model = model
         self.optimal_threshold = float(optimal_threshold)
 
-    def predict(self, context, model_input, params=None):
+    def predict(self, context, model_input, params=None) -> pd.DataFrame:
+        """Predict probabilities and binary classes for a batch of inputs.
+
+        Args:
+            context: MLflow PythonModelContext (unused; required by the pyfunc API).
+            model_input: Features as a pandas DataFrame or numpy array.
+            params: Optional inference parameters (unused).
+
+        Returns:
+            DataFrame with `probability` (float, P(CVD)) and `prediction`
+            (int, 0/1) columns.
+        """
         if isinstance(model_input, np.ndarray):
             model_input = pd.DataFrame(model_input)
-        proba = self.model.predict_proba(model_input)[:, 1]
+        proba      = self.model.predict_proba(model_input)[:, 1]
         prediction = (proba >= self.optimal_threshold).astype(int)
         return pd.DataFrame({
             "probability": proba,
@@ -239,6 +326,7 @@ class CardioModel(mlflow.pyfunc.PythonModel):
 # COMMAND ----------
 
 # DBTITLE 1,Load features table
+# Pull the feature table into pandas — 70k rows fit comfortably in driver memory.
 try:
     features_spark = spark.table(FULL_SOURCE)
     features_df    = features_spark.toPandas()
@@ -255,11 +343,17 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Feature/target split
+# Separate features from the target and confirm no nulls (silver should have imputed them).
+# Features excluded from training — derived from other features (see EDA).
+# Mutual information confirmed they have less info than their raw components,
+# and Spearman correlation >0.75 with their parent features → multicollinearity.
+EXCLUDED_FEATURES = ["hypertension", "pulse_pressure", "age_group_id"]
+
 try:
     if TARGET_COLUMN not in features_df.columns:
         raise Exception(f"Target column '{TARGET_COLUMN}' not found in {FULL_SOURCE}.")
 
-    feature_columns = [c for c in features_df.columns if c != TARGET_COLUMN]
+    feature_columns = [c for c in features_df.columns if c != TARGET_COLUMN and c != "hypertension"  and c not in EXCLUDED_FEATURES]
     X = features_df[feature_columns].copy()
     y = features_df[TARGET_COLUMN].astype(int).copy()
 
@@ -282,6 +376,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Three-way stratified split
+# Two-pass split: first carve out test (15%), then split the remaining 85% into train/val.
 try:
     # Pass 1: separate test (15%) from the rest (85%)
     X_trainval, X_test, y_trainval, y_test = train_test_split(
@@ -328,6 +423,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,XGBoost baseline
+# Untuned XGBoost — establishes a reference performance for the tuned model to beat.
 try:
     baseline_xgb = XGBClassifier(
         random_state=RANDOM_STATE,
@@ -350,6 +446,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Random Forest baseline
+# Untuned Random Forest — reference performance for the second tuned candidate.
 try:
     baseline_rf = RandomForestClassifier(
         random_state=RANDOM_STATE,
@@ -375,6 +472,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Stratified KFold setup
+# Stratified folds preserve class balance across splits — essential for imbalanced binary targets.
 cv_splitter = StratifiedKFold(
     n_splits=CV_FOLDS,
     shuffle=True,
@@ -384,6 +482,7 @@ cv_splitter = StratifiedKFold(
 # COMMAND ----------
 
 # DBTITLE 1,CV - baseline XGBoost
+# Cross-validate the untuned XGBoost to get a robust performance reference.
 try:
     cv_baseline_xgb_mean, cv_baseline_xgb_std, _ = cv_evaluate(
         XGBClassifier(random_state=RANDOM_STATE, n_jobs=-1,
@@ -399,6 +498,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,CV - baseline Random Forest
+# Cross-validate the untuned Random Forest for symmetry with XGBoost.
 try:
     cv_baseline_rf_mean, cv_baseline_rf_std, _ = cv_evaluate(
         RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1),
@@ -418,7 +518,21 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Objective - XGBoost
-def objective_xgboost(trial):
+# Optuna objective for XGBoost — early stopping inside the trial speeds tuning ~2-3x.
+def objective_xgboost(trial: optuna.Trial) -> float:
+    """Optuna objective for the XGBoost search.
+
+    Suggests a hyperparameter combination, fits on `X_train` with early stopping
+    against `X_val`, and returns the validation ROC-AUC. Stores the actual
+    `best_iteration` as a user attribute so downstream steps can use the
+    truncated tree count instead of the upper-bound `n_estimators`.
+
+    Args:
+        trial: Optuna Trial object.
+
+    Returns:
+        Validation ROC-AUC achieved by this hyperparameter combination.
+    """
     suggested_params = {
         "n_estimators":     trial.suggest_int("n_estimators", 100, 500),
         "max_depth":        trial.suggest_int("max_depth", 3, 10),
@@ -449,6 +563,7 @@ def objective_xgboost(trial):
 # COMMAND ----------
 
 # DBTITLE 1,Run Optuna - XGBoost
+# Launch the XGBoost tuning study; afterward replace the suggested n_estimators with the actual best_iteration.
 try:
     sampler_xgb = TPESampler(seed=RANDOM_STATE)
     study_xgb   = optuna.create_study(direction="maximize", sampler=sampler_xgb,
@@ -477,12 +592,22 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Objective - Random Forest
-def objective_rf(trial):
-    # Search space deliberately narrowed for speed:
-    # - n_estimators capped at 300 (more rarely helps on tabular data)
-    # - max_depth capped at 20 (deeper trees overfit + train slower)
-    # - max_features excludes None (using all features per split is slow and overfits)
-    # - bootstrap fixed to True (False disables subsampling — slow + worse generalization)
+# Optuna objective for Random Forest — search space narrowed deliberately for speed (see inline notes).
+def objective_rf(trial: optuna.Trial) -> float:
+    """Optuna objective for the Random Forest search.
+
+    Search space deliberately narrowed for speed:
+      - n_estimators capped at 300 (more rarely helps on tabular data).
+      - max_depth capped at 20 (deeper trees overfit + train slower).
+      - max_features excludes None (using all features per split is slow and overfits).
+      - bootstrap fixed to True (False disables subsampling — slow + worse generalisation).
+
+    Args:
+        trial: Optuna Trial object.
+
+    Returns:
+        Validation ROC-AUC achieved by this hyperparameter combination.
+    """
     params = {
         "n_estimators":      trial.suggest_int("n_estimators", 100, 300),
         "max_depth":         trial.suggest_int("max_depth", 3, 20),
@@ -502,6 +627,7 @@ def objective_rf(trial):
 # COMMAND ----------
 
 # DBTITLE 1,Run Optuna - Random Forest
+# Launch the Random Forest tuning study (same trial budget as XGBoost).
 try:
     sampler_rf = TPESampler(seed=RANDOM_STATE)
     study_rf   = optuna.create_study(direction="maximize", sampler=sampler_rf,
@@ -526,6 +652,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,CV - tuned XGBoost
+# Cross-validate the tuned XGBoost to confirm the gain over baseline is robust.
 try:
     tuned_xgb = XGBClassifier(
         **best_params_xgb,
@@ -544,6 +671,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,CV - tuned Random Forest
+# Cross-validate the tuned Random Forest under the same protocol as XGBoost.
 try:
     tuned_rf = RandomForestClassifier(
         **best_params_rf,
@@ -561,6 +689,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Comparison and winner selection
+# Pick the algorithm with the higher CV ROC-AUC as the winner for the rest of the pipeline.
 try:
     comparison_df = pd.DataFrame([
         {"model": "baseline_xgboost", "cv_mean": cv_baseline_xgb_mean, "cv_std": cv_baseline_xgb_std},
@@ -572,17 +701,17 @@ try:
 
     # Winner between the two tuned models
     if cv_tuned_xgb_mean >= cv_tuned_rf_mean:
-        WINNER_ALGORITHM = "XGBoost"
-        winner_estimator = tuned_xgb
+        WINNER_ALGORITHM   = "XGBoost"
+        winner_estimator   = tuned_xgb
         winner_best_params = best_params_xgb
-        winner_cv_mean = cv_tuned_xgb_mean
-        winner_cv_std  = cv_tuned_xgb_std
+        winner_cv_mean     = cv_tuned_xgb_mean
+        winner_cv_std      = cv_tuned_xgb_std
     else:
-        WINNER_ALGORITHM = "RandomForest"
-        winner_estimator = tuned_rf
+        WINNER_ALGORITHM   = "RandomForest"
+        winner_estimator   = tuned_rf
         winner_best_params = best_params_rf
-        winner_cv_mean = cv_tuned_rf_mean
-        winner_cv_std  = cv_tuned_rf_std
+        winner_cv_mean     = cv_tuned_rf_mean
+        winner_cv_std      = cv_tuned_rf_std
 
     print(f"\nWINNER: {WINNER_ALGORITHM}")
     print(f"  CV {OPTIMIZATION_METRIC}: {winner_cv_mean:.4f} ± {winner_cv_std:.4f}")
@@ -598,6 +727,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Sweep thresholds with winner trained on train-only
+# Train a fresh copy of the winner on train only, then sweep thresholds against validation F1.
 try:
     winner_train_only = type(winner_estimator)(**winner_estimator.get_params())
     winner_train_only.fit(X_train, y_train)
@@ -618,6 +748,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Threshold sweep plot
+# Visualise how F1, precision and recall trade off across the threshold grid.
 try:
     fig_threshold, ax = plt.subplots(figsize=(9, 5))
     ax.plot(threshold_results["threshold"], threshold_results["score"],
@@ -646,6 +777,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Retrain winner on train + val combined
+# Now that hyperparameters and threshold are fixed, refit on train+val for maximum signal.
 try:
     X_trainval_combined = pd.concat([X_train, X_val], axis=0).reset_index(drop=True)
     y_trainval_combined = pd.concat([y_train, y_val], axis=0).reset_index(drop=True)
@@ -667,8 +799,9 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Compute final metrics
+# Evaluate the final model on the held-out test set using the embedded optimal threshold.
 try:
-    final_test_proba = final_estimator.predict_proba(X_test)[:, 1]
+    final_test_proba   = final_estimator.predict_proba(X_test)[:, 1]
     final_test_metrics = compute_metrics(y_test, final_test_proba,
                                          threshold=optimal_threshold)
 
@@ -682,6 +815,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Confusion matrix
+# Confusion matrix and per-class report — reveals where the model errs (FP vs FN).
 try:
     y_test_pred = (final_test_proba >= optimal_threshold).astype(int)
     cm = confusion_matrix(y_test, y_test_pred)
@@ -706,8 +840,9 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,ROC and PR curves
+# Visualise discrimination (ROC) and class-imbalance-aware performance (PR) on test.
 try:
-    fpr, tpr, _ = roc_curve(y_test, final_test_proba)
+    fpr, tpr, _                      = roc_curve(y_test, final_test_proba)
     precision_curve, recall_curve, _ = precision_recall_curve(y_test, final_test_proba)
 
     fig_curves, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(13, 5))
@@ -743,6 +878,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Feature importance
+# Tree-based feature importance (gain) — quick global view of what drives predictions.
 try:
     feature_importance = pd.DataFrame({
         "feature":    feature_columns,
@@ -772,16 +908,17 @@ except Exception as e:
 # MAGIC # 12. Register as @candidate
 # MAGIC
 # MAGIC Always registers a new version and moves the `@candidate` alias to it.
-# MAGIC Promotion to `@champion` is decided in `cardioPromotion.py`.
+# MAGIC Promotion to `@champion` is decided in `ml_promote_cardio_classifier.py`.
 
 # COMMAND ----------
 
 # DBTITLE 1,Build pyfunc artifact
+# Wrap the fitted estimator with CardioModel (embeds threshold) and infer the input/output signature.
 try:
     wrapped_model = CardioModel(final_estimator, optimal_threshold)
 
-    sample_input  = X_train.head(5)
-    sample_output = wrapped_model.predict(None, sample_input)
+    sample_input    = X_train.head(5)
+    sample_output   = wrapped_model.predict(None, sample_input)
     model_signature = infer_signature(sample_input, sample_output)
 
     pip_requirements = [
@@ -800,7 +937,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Log run, register and set @candidate
-# DBTITLE 1,Log run, register and set @candidate
+# Single MLflow run: tags + params + metrics + figures + tables + model, then register and set @candidate alias.
 try:
     with mlflow.start_run(run_name=f"cardio_training_{WINNER_ALGORITHM.lower()}") as run:
         # Tags
@@ -810,22 +947,22 @@ try:
             "optimal.threshold": f"{optimal_threshold:.4f}",
         })
 
-        # Parameters (cardioPromotion.py will read random_state/test_size/val_size
+        # Parameters (ml_promote_cardio_classifier.py reads random_state/test_size/val_size
         # from these to reconstruct the same test split)
         mlflow.log_params({
-            "winner_algorithm":       WINNER_ALGORITHM,
-            "optimal_threshold":      optimal_threshold,
-            "n_optuna_trials":        N_OPTUNA_TRIALS,
-            "cv_folds":               CV_FOLDS,
-            "test_size":              TEST_SIZE,
-            "val_size":               VAL_SIZE,
-            "random_state":           RANDOM_STATE,
-            "source_table":           FULL_SOURCE,
-            "target_column":          TARGET_COLUMN,
-            "feature_count":          len(feature_columns),
-            "train_rows":             len(X_train),
-            "validation_rows":        len(X_val),
-            "test_rows":              len(X_test),
+            "winner_algorithm":  WINNER_ALGORITHM,
+            "optimal_threshold": optimal_threshold,
+            "n_optuna_trials":   N_OPTUNA_TRIALS,
+            "cv_folds":          CV_FOLDS,
+            "test_size":         TEST_SIZE,
+            "val_size":          VAL_SIZE,
+            "random_state":      RANDOM_STATE,
+            "source_table":      FULL_SOURCE,
+            "target_column":     TARGET_COLUMN,
+            "feature_count":     len(feature_columns),
+            "train_rows":        len(X_train),
+            "validation_rows":   len(X_val),
+            "test_rows":         len(X_test),
             **{f"winner_{k}": v for k, v in winner_best_params.items()},
         })
 
@@ -869,11 +1006,11 @@ try:
 
         # Log the model artifact
         mlflow.pyfunc.log_model(
-            artifact_path=     "model",
-            python_model=      wrapped_model,
-            signature=         model_signature,
-            input_example=     sample_input,
-            pip_requirements=  pip_requirements,
+            artifact_path=    "model",
+            python_model=     wrapped_model,
+            signature=        model_signature,
+            input_example=    sample_input,
+            pip_requirements= pip_requirements,
         )
         run_id    = run.info.run_id
         model_uri = f"runs:/{run_id}/model"
@@ -890,7 +1027,7 @@ try:
             version=registered.version,
         )
 
-        # Version-level metadata (consumed by cardioPromotion.py)
+        # Version-level metadata (consumed by ml_promote_cardio_classifier.py)
         mlflow_client.update_model_version(
             name=REGISTERED_MODEL_NAME,
             version=registered.version,
@@ -923,6 +1060,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Training summary
+# Print a final summary block so the run is easy to interpret from the notebook output.
 print("=" * 70)
 print("TRAINING PIPELINE SUMMARY")
 print("=" * 70)
@@ -939,6 +1077,6 @@ print(f"Candidate alias:         @{CANDIDATE_ALIAS} → v{candidate_version}")
 print(f"MLflow run id:           {run_id}")
 print("-" * 70)
 print("NEXT STEP:")
-print("  Run cardioPromotion.py to decide if this candidate becomes the new")
-print("  @champion. The serving endpoint always tracks @champion only.")
+print("  Run ml_promote_cardio_classifier.py to decide if this candidate becomes")
+print("  the new @champion. The serving endpoint always tracks @champion only.")
 print("=" * 70)

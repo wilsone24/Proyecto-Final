@@ -6,25 +6,18 @@
 # MAGIC %md
 # MAGIC # Cardiovascular Disease — Model Promotion
 # MAGIC
-# MAGIC Champion-challenger governance step. Compares the current `@candidate`
-# MAGIC (produced by `cardioML.py`) against the current `@champion` and, if the
-# MAGIC candidate beats the champion on the agreed metric, moves the `@champion`
-# MAGIC alias forward. Otherwise the champion is kept untouched.
-# MAGIC
-# MAGIC The test split is reconstructed deterministically from the candidate's
-# MAGIC training parameters (`random_state`, `test_size`, `val_size`) so both
-# MAGIC models are evaluated on **exactly the same** rows.
-# MAGIC
-# MAGIC **Pipeline version:** `1.0.0`
+# MAGIC Compares `@candidate` vs `@champion` on the same test split; promotes the candidate if it wins.
 
 # COMMAND ----------
 
 # DBTITLE 1,Install dependencies
-# MAGIC %pip install xgboost
+# Install ML libraries required to load the candidate / champion pyfunc models.
+%pip install xgboost
 
 # COMMAND ----------
 
 # DBTITLE 1,Restart Python
+# Restart the Python kernel so the freshly-installed libraries are picked up.
 dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -35,11 +28,13 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 # DBTITLE 1,Catalog
+# Set the active Unity Catalog for all subsequent table references.
 spark.sql("USE CATALOG `databricks_service_pf`")
 
 # COMMAND ----------
 
 # DBTITLE 1,Libraries
+# sklearn for metrics + reconstructing the same train/test split, MLflow for model loading and registry ops.
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -65,32 +60,49 @@ plt.rcParams["figure.dpi"] = 110
 # COMMAND ----------
 
 # DBTITLE 1,Parameters
+# Job-level inputs: target model and MLflow experiment (only fields that change between dev/prod).
 dbutils.widgets.text("registered_model_name",  "databricks_service_pf.gold.cardio_classifier")
-dbutils.widgets.text("candidate_alias",        "candidate")
-dbutils.widgets.text("champion_alias",         "champion")
 dbutils.widgets.text("mlflow_experiment_path", "/Shared/cardio_ml")
-dbutils.widgets.text("comparison_metric",      "roc_auc")
-dbutils.widgets.text("min_improvement",        "0.0")
 
 # COMMAND ----------
 
-# DBTITLE 1,Variables
+# DBTITLE 1,Constants
+# Validate widgets and derive runtime constants (registry conventions, comparison policy, run tags).
 REGISTERED_MODEL_NAME  = dbutils.widgets.get("registered_model_name")
-CANDIDATE_ALIAS        = dbutils.widgets.get("candidate_alias")
-CHAMPION_ALIAS         = dbutils.widgets.get("champion_alias")
 MLFLOW_EXPERIMENT_PATH = dbutils.widgets.get("mlflow_experiment_path")
-COMPARISON_METRIC      = dbutils.widgets.get("comparison_metric")
-MIN_IMPROVEMENT        = float(dbutils.widgets.get("min_improvement"))
 
+# Fail fast if any required widget was not provided
+if not all([REGISTERED_MODEL_NAME, MLFLOW_EXPERIMENT_PATH]):
+    raise ValueError(
+        f"Missing required widgets: registered_model_name='{REGISTERED_MODEL_NAME}', "
+        f"mlflow_experiment_path='{MLFLOW_EXPERIMENT_PATH}'"
+    )
+
+# Registry conventions (MLflow Model Registry aliases — not environment-specific)
+CANDIDATE_ALIAS = "candidate"
+CHAMPION_ALIAS  = "champion"
+
+# Promotion policy
+COMPARISON_METRIC = "roc_auc"   # metric used to compare candidate vs champion
+MIN_IMPROVEMENT   = 0.0         # candidate must beat champion by strictly more than this
+
+# Features excluded from training — must match ml_train_cardio_classifier.py.
+# Derived features that cause multicollinearity / information leakage:
+#   - hypertension: ap_hi >= 140 OR ap_lo >= 90 (function of systolic_bp + diastolic_bp)
+#   - pulse_pressure: systolic_bp - diastolic_bp
+#   - age_group_id: bucket of age_years
+EXCLUDED_FEATURES = ["hypertension", "pulse_pressure", "age_group_id"]
+
+# Pipeline metadata
 PIPELINE_VERSION = "1.0.0"
 
 RUN_TAGS = {
-    "pipeline.version":   PIPELINE_VERSION,
-    "data.subject":       "cardiovascular-disease",
-    "data.layer":         "gold",
-    "stage":              "promotion",
-    "comparison.metric":  COMPARISON_METRIC,
-    "min.improvement":    f"{MIN_IMPROVEMENT:.4f}",
+    "pipeline.version":  PIPELINE_VERSION,
+    "data.subject":      "cardiovascular-disease",
+    "data.layer":        "gold",
+    "stage":             "promotion",
+    "comparison.metric": COMPARISON_METRIC,
+    "min.improvement":   f"{MIN_IMPROVEMENT:.4f}",
 }
 
 print(f"Registered model:    {REGISTERED_MODEL_NAME}")
@@ -102,6 +114,7 @@ print(f"Minimum improvement: {MIN_IMPROVEMENT} (strict > if 0)")
 # COMMAND ----------
 
 # DBTITLE 1,MLflow configuration
+# Point MLflow at the Unity Catalog model registry and the shared experiment path.
 try:
     mlflow.set_registry_uri("databricks-uc")
     mlflow.set_experiment(MLFLOW_EXPERIMENT_PATH)
@@ -114,8 +127,23 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Helper functions
-def compute_metrics(y_true, y_proba, threshold=0.5):
-    """Compute the full classification metric suite given probabilities and a threshold."""
+# Reusable utilities for metrics, probability extraction and version-metadata lookup.
+def compute_metrics(
+    y_true: pd.Series,
+    y_proba: np.ndarray,
+    threshold: float = 0.5,
+) -> dict:
+    """Compute the full classification metric suite for binary classification.
+
+    Args:
+        y_true: Ground-truth binary labels (0/1).
+        y_proba: Predicted probabilities for the positive class.
+        threshold: Decision threshold used to derive binary predictions from probabilities.
+
+    Returns:
+        Dict with keys: accuracy, precision, recall, f1 (threshold-dependent),
+        roc_auc and pr_auc (threshold-independent).
+    """
     y_pred = (y_proba >= threshold).astype(int)
     return {
         "accuracy":  accuracy_score(y_true, y_pred),
@@ -127,13 +155,19 @@ def compute_metrics(y_true, y_proba, threshold=0.5):
     }
 
 
-def get_probabilities(model, X):
-    """
-    Extract positive-class probabilities from a pyfunc-loaded model.
+def get_probabilities(model, X: pd.DataFrame) -> np.ndarray:
+    """Extract positive-class probabilities from a pyfunc-loaded model.
 
     The CardioModel wrapper returns a DataFrame with `probability` and
     `prediction` columns; older or different wrappers may return a plain array.
     This helper handles both cases.
+
+    Args:
+        model: An MLflow pyfunc-loaded model (output of mlflow.pyfunc.load_model).
+        X: Feature matrix to score.
+
+    Returns:
+        1-D numpy array of positive-class probabilities, one per row of X.
     """
     output = model.predict(X)
     if isinstance(output, pd.DataFrame):
@@ -143,19 +177,29 @@ def get_probabilities(model, X):
     return np.asarray(output, dtype=float).ravel()
 
 
-def read_version_metadata(model_name, version):
-    """Pull the metadata cardioML.py wrote at registration time."""
+def read_version_metadata(model_name: str, version: str) -> dict:
+    """Pull the metadata ml_train_cardio_classifier.py wrote at registration time.
+
+    Args:
+        model_name: Fully-qualified Unity Catalog model name.
+        version: Model version number (as string or int).
+
+    Returns:
+        Dict with keys: version, run_id, description, algorithm, optimal_threshold,
+        test_roc_auc, training_run_id, pipeline_version. Missing tags fall back to
+        sensible defaults (e.g. NaN for test_roc_auc, 0.5 for optimal_threshold).
+    """
     info = mlflow_client.get_model_version(model_name, version)
     tags = dict(info.tags) if info.tags else {}
     return {
         "version":           info.version,
         "run_id":            info.run_id,
         "description":       info.description or "",
-        "algorithm":         tags.get("algorithm",         "unknown"),
+        "algorithm":         tags.get("algorithm",        "unknown"),
         "optimal_threshold": float(tags.get("optimal_threshold", 0.5)),
-        "test_roc_auc":      float(tags.get("test_roc_auc",      "nan")) if tags.get("test_roc_auc") else float("nan"),
-        "training_run_id":   tags.get("training_run_id",   info.run_id),
-        "pipeline_version":  tags.get("pipeline_version",  "unknown"),
+        "test_roc_auc":      float(tags.get("test_roc_auc", "nan")) if tags.get("test_roc_auc") else float("nan"),
+        "training_run_id":   tags.get("training_run_id",  info.run_id),
+        "pipeline_version":  tags.get("pipeline_version", "unknown"),
     }
 
 # COMMAND ----------
@@ -166,6 +210,7 @@ def read_version_metadata(model_name, version):
 # COMMAND ----------
 
 # DBTITLE 1,Resolve @candidate (must exist)
+# The promotion notebook requires a candidate — if missing, training never ran successfully.
 try:
     candidate_info = mlflow_client.get_model_version_by_alias(
         REGISTERED_MODEL_NAME, CANDIDATE_ALIAS,
@@ -177,7 +222,7 @@ try:
 except mlflow.exceptions.RestException as e:
     raise Exception(
         f"[Candidate] No @{CANDIDATE_ALIAS} alias found on {REGISTERED_MODEL_NAME}. "
-        f"Run cardioML.py first to produce a candidate. Details: {e}"
+        f"Run ml_train_cardio_classifier.py first to produce a candidate. Details: {e}"
     )
 
 except Exception as e:
@@ -186,6 +231,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Resolve @champion (may not exist → cold start)
+# Missing champion is the COLD START path — the candidate is promoted unconditionally.
 champion_meta = None
 is_cold_start = False
 
@@ -216,11 +262,13 @@ except Exception as e:
 # MAGIC We read `random_state`, `test_size`, `val_size`, `source_table` and
 # MAGIC `target_column` from the candidate's training run and replay the same
 # MAGIC stratified split. Because the seed and parameters are identical, the
-# MAGIC reconstructed test set is byte-equal to the one cardioML.py evaluated on.
+# MAGIC reconstructed test set is byte-equal to the one ml_train_cardio_classifier.py
+# MAGIC evaluated on.
 
 # COMMAND ----------
 
 # DBTITLE 1,Read training params from candidate's run
+# Pull the exact source table, target, split sizes and seed used by training.
 try:
     training_run = mlflow_client.get_run(candidate_meta["training_run_id"])
     train_params = training_run.data.params
@@ -243,14 +291,20 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Load source and rebuild test set
+# Replay the first split (test vs trainval) — that's enough since both models are evaluated on test.
 try:
     features_df = spark.table(SOURCE_TABLE_FROM_RUN).toPandas()
 
-    feature_columns = [c for c in features_df.columns if c != TARGET_COLUMN]
+    # Mirror the exclusion applied during training so X has the same columns
+    # the candidate model expects (otherwise predict() fails on schema mismatch).
+    feature_columns = [
+        c for c in features_df.columns
+        if c != TARGET_COLUMN and c not in EXCLUDED_FEATURES
+    ]
     X = features_df[feature_columns].copy()
     y = features_df[TARGET_COLUMN].astype(int).copy()
 
-    # Replay exact same split as cardioML.py
+    # Replay exact same split as ml_train_cardio_classifier.py
     X_trainval, X_test, y_trainval, y_test = train_test_split(
         X, y,
         test_size=TEST_SIZE,
@@ -271,10 +325,11 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Evaluate candidate
+# Load the candidate via its alias and score the reconstructed test set.
 try:
-    candidate_uri   = f"models:/{REGISTERED_MODEL_NAME}@{CANDIDATE_ALIAS}"
-    candidate_model = mlflow.pyfunc.load_model(candidate_uri)
-    candidate_proba = get_probabilities(candidate_model, X_test)
+    candidate_uri     = f"models:/{REGISTERED_MODEL_NAME}@{CANDIDATE_ALIAS}"
+    candidate_model   = mlflow.pyfunc.load_model(candidate_uri)
+    candidate_proba   = get_probabilities(candidate_model, X_test)
     candidate_metrics = compute_metrics(
         y_test, candidate_proba, threshold=candidate_meta["optimal_threshold"],
     )
@@ -289,14 +344,15 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Evaluate champion (if exists)
+# Skip silently on cold start; otherwise score the champion on the same test set.
 champion_metrics = None
 champion_proba   = None
 
 if not is_cold_start:
     try:
-        champion_uri   = f"models:/{REGISTERED_MODEL_NAME}@{CHAMPION_ALIAS}"
-        champion_model = mlflow.pyfunc.load_model(champion_uri)
-        champion_proba = get_probabilities(champion_model, X_test)
+        champion_uri     = f"models:/{REGISTERED_MODEL_NAME}@{CHAMPION_ALIAS}"
+        champion_model   = mlflow.pyfunc.load_model(champion_uri)
+        champion_proba   = get_probabilities(champion_model, X_test)
         champion_metrics = compute_metrics(
             y_test, champion_proba, threshold=champion_meta["optimal_threshold"],
         )
@@ -311,6 +367,7 @@ if not is_cold_start:
 # COMMAND ----------
 
 # DBTITLE 1,Side-by-side comparison
+# Build a comparison DataFrame with champion / candidate / delta for every metric.
 try:
     if champion_metrics is not None:
         rows = []
@@ -337,6 +394,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Comparison plot (ROC curves side by side)
+# Overlay the ROC curves of champion and candidate on the same axes — visual sanity check.
 fig_compare = None
 try:
     if champion_metrics is not None:
@@ -369,24 +427,25 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Decide whether to promote
+# Four branches: cold_start → promote, same version → skip, beats threshold → promote, else keep champion.
 candidate_score = float(candidate_metrics[COMPARISON_METRIC])
 champion_score  = float(champion_metrics[COMPARISON_METRIC]) if champion_metrics else None
 
 if is_cold_start:
-    should_promote = True
+    should_promote  = True
     decision_reason = "cold_start"
-    delta_score = None
+    delta_score     = None
 elif str(champion_meta["version"]) == str(candidate_meta["version"]):
-    should_promote = False
+    should_promote  = False
     decision_reason = "same_version"
-    delta_score = 0.0
+    delta_score     = 0.0
 else:
     delta_score = candidate_score - champion_score
     if delta_score > MIN_IMPROVEMENT:
-        should_promote = True
+        should_promote  = True
         decision_reason = "beats_champion"
     else:
-        should_promote = False
+        should_promote  = False
         decision_reason = "below_threshold"
 
 print("=" * 60)
@@ -408,6 +467,7 @@ print("=" * 60)
 # COMMAND ----------
 
 # DBTITLE 1,Move @champion alias if promoted
+# Single MLflow run: log tags + params + metrics + comparison artifacts, then apply the alias move.
 try:
     with mlflow.start_run(run_name=f"cardio_promotion_v{candidate_meta['version']}") as run:
         # Tags
@@ -423,16 +483,16 @@ try:
 
         # Parameters
         mlflow.log_params({
-            "registered_model_name":   REGISTERED_MODEL_NAME,
-            "candidate_alias":         CANDIDATE_ALIAS,
-            "champion_alias":          CHAMPION_ALIAS,
-            "candidate_version":       candidate_meta["version"],
-            "champion_version_prev":   champion_meta["version"] if champion_meta else "none",
-            "candidate_threshold":     candidate_meta["optimal_threshold"],
-            "champion_threshold":      champion_meta["optimal_threshold"] if champion_meta else "none",
-            "comparison_metric":       COMPARISON_METRIC,
-            "min_improvement":         MIN_IMPROVEMENT,
-            "test_rows":               len(X_test),
+            "registered_model_name": REGISTERED_MODEL_NAME,
+            "candidate_alias":       CANDIDATE_ALIAS,
+            "champion_alias":        CHAMPION_ALIAS,
+            "candidate_version":     candidate_meta["version"],
+            "champion_version_prev": champion_meta["version"] if champion_meta else "none",
+            "candidate_threshold":   candidate_meta["optimal_threshold"],
+            "champion_threshold":    champion_meta["optimal_threshold"] if champion_meta else "none",
+            "comparison_metric":     COMPARISON_METRIC,
+            "min_improvement":       MIN_IMPROVEMENT,
+            "test_rows":             len(X_test),
         })
 
         # Metrics
@@ -487,6 +547,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Promotion summary
+# Final summary block so the run is easy to interpret from the notebook output.
 print("=" * 70)
 print("PROMOTION SUMMARY")
 print("=" * 70)
@@ -511,8 +572,7 @@ print("=" * 70)
 print()
 print("NEXT STEP:")
 if should_promote:
-    print(f"  Re-run cardioServing.py to update the serving endpoint with the new")
+    print(f"  Re-run ml_serve_cardio_classifier.py to update the serving endpoint with the new")
     print(f"  champion version (v{candidate_meta['version']}).")
 else:
     print(f"  No action needed. The serving endpoint already serves the active champion.")
-

@@ -6,17 +6,7 @@
 # MAGIC %md
 # MAGIC # Cardiovascular Disease — Model Serving Endpoint
 # MAGIC
-# MAGIC Idempotent notebook that exposes the current `@champion` version of
-# MAGIC `databricks_service_pf.gold.cardio_classifier` as a Databricks Model Serving REST endpoint.
-# MAGIC
-# MAGIC On each run it:
-# MAGIC 1. Resolves the version pointed to by the alias.
-# MAGIC 2. Creates the endpoint if it doesn't exist, or updates it if the version changed.
-# MAGIC 3. Waits until the endpoint is `READY`.
-# MAGIC 4. Runs a smoke-test inference with sample rows from the source.
-# MAGIC 5. Prints curl and Python invocation snippets.
-# MAGIC
-# MAGIC **Pipeline version:** `1.0.0`
+# MAGIC Deploys the current `@champion` model version as a Databricks Model Serving REST endpoint.
 
 # COMMAND ----------
 
@@ -26,17 +16,19 @@
 # COMMAND ----------
 
 # DBTITLE 1,Catalog
+# Set the active Unity Catalog for all subsequent table references.
 spark.sql("USE CATALOG `databricks_service_pf`")
 
 # COMMAND ----------
 
 # DBTITLE 1,Libraries
+# MLflow for the model registry, Databricks SDK for the serving endpoint, pandas for smoke-test data.
 import warnings
 warnings.filterwarnings("ignore")
 
 import json
-import time
 import pandas as pd
+from datetime import timedelta
 
 import mlflow
 from mlflow.tracking import MlflowClient
@@ -52,33 +44,53 @@ from databricks.sdk.errors import ResourceDoesNotExist
 # COMMAND ----------
 
 # DBTITLE 1,Parameters
+# Job-level inputs: source feature table, target model, endpoint config.
 dbutils.widgets.text("source_schema",          "gold")
-dbutils.widgets.text("source_table",           "cardiofeatures")
-dbutils.widgets.text("target_column",          "cardio")
+dbutils.widgets.text("source_table",           "cardio_features")
 dbutils.widgets.text("registered_model_name",  "databricks_service_pf.gold.cardio_classifier")
-dbutils.widgets.text("champion_alias",         "champion")
 dbutils.widgets.text("endpoint_name",          "cardio-classifier-endpoint")
 dbutils.widgets.text("workload_size",          "Small")
 dbutils.widgets.text("scale_to_zero",          "true")
-dbutils.widgets.text("smoke_test_rows",        "3")
 
 # COMMAND ----------
 
-# DBTITLE 1,Variables
+# DBTITLE 1,Constants
+# Validate widgets and derive runtime constants (endpoint config, tags, timeout, alias, served-entity name).
 SOURCE_SCHEMA         = dbutils.widgets.get("source_schema")
 SOURCE_TABLE          = dbutils.widgets.get("source_table")
-TARGET_COLUMN         = dbutils.widgets.get("target_column")
 REGISTERED_MODEL_NAME = dbutils.widgets.get("registered_model_name")
-CHAMPION_ALIAS        = dbutils.widgets.get("champion_alias")
 ENDPOINT_NAME         = dbutils.widgets.get("endpoint_name")
 WORKLOAD_SIZE         = dbutils.widgets.get("workload_size")
 SCALE_TO_ZERO         = dbutils.widgets.get("scale_to_zero").lower() == "true"
-SMOKE_TEST_ROWS       = int(dbutils.widgets.get("smoke_test_rows"))
 
-FULL_SOURCE        = f"{SOURCE_SCHEMA}.{SOURCE_TABLE}"
-PIPELINE_VERSION   = "1.0.0"
-READY_TIMEOUT_MIN  = 30   # max minutes to wait for endpoint to be READY
+# Fail fast if any required widget was not provided
+if not all([SOURCE_SCHEMA, SOURCE_TABLE, REGISTERED_MODEL_NAME, ENDPOINT_NAME, WORKLOAD_SIZE]):
+    raise ValueError(
+        f"Missing required widgets: source_schema='{SOURCE_SCHEMA}', "
+        f"source_table='{SOURCE_TABLE}', "
+        f"registered_model_name='{REGISTERED_MODEL_NAME}', "
+        f"endpoint_name='{ENDPOINT_NAME}', workload_size='{WORKLOAD_SIZE}'"
+    )
 
+# Model invariants (not environment-specific)
+TARGET_COLUMN  = "cardio"
+CHAMPION_ALIAS = "champion"
+
+# Features excluded from training — must match ml_train_cardio_classifier.py.
+# The smoke test drops these from the payload so the request matches what the
+# served model expects.
+EXCLUDED_FEATURES = ["hypertension", "pulse_pressure", "age_group_id"]
+
+# Smoke-test configuration
+SMOKE_TEST_ROWS = 3
+
+# Derived constants
+FULL_SOURCE         = f"{SOURCE_SCHEMA}.{SOURCE_TABLE}"
+PIPELINE_VERSION    = "1.0.0"
+SERVED_ENTITY_NAME  = "cardio-champion"
+READY_TIMEOUT       = timedelta(minutes=30)  # max wait for endpoint to be READY
+
+# Endpoint tags — keys must be snake_case (Databricks Serving rejects dots/colons/slashes).
 ENDPOINT_TAGS = [
     EndpointTag(key="pipeline_version", value=PIPELINE_VERSION),
     EndpointTag(key="data_subject",     value="cardiovascular-disease"),
@@ -97,6 +109,7 @@ print(f"Scale to zero:     {SCALE_TO_ZERO}")
 # COMMAND ----------
 
 # DBTITLE 1,Clients
+# Initialise MLflow (Unity Catalog registry) and Databricks SDK clients used throughout the notebook.
 try:
     mlflow.set_registry_uri("databricks-uc")
     mlflow_client    = MlflowClient()
@@ -115,8 +128,9 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Get version pointed to by alias
+# Look up which model version currently holds the @champion alias.
 try:
-    champion_info = mlflow_client.get_model_version_by_alias(
+    champion_info    = mlflow_client.get_model_version_by_alias(
         REGISTERED_MODEL_NAME, CHAMPION_ALIAS,
     )
     champion_version = champion_info.version
@@ -133,7 +147,7 @@ try:
 except mlflow.exceptions.RestException as e:
     raise Exception(
         f"[Champion] No @{CHAMPION_ALIAS} alias found on {REGISTERED_MODEL_NAME}. "
-        f"Run cardioML.py first to register an initial model. Details: {e}"
+        f"Run ml_train_cardio_classifier.py first to register an initial model. Details: {e}"
     )
 
 except Exception as e:
@@ -147,13 +161,14 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Build endpoint config
+# Build the ServedEntityInput describing what to serve (model, version, compute size, autoscaling).
 try:
     served_entity = ServedEntityInput(
-        entity_name=          REGISTERED_MODEL_NAME,
-        entity_version=       champion_version,
-        workload_size=        WORKLOAD_SIZE,
-        scale_to_zero_enabled=SCALE_TO_ZERO,
-        name=                 "cardio-champion",
+        entity_name=           REGISTERED_MODEL_NAME,
+        entity_version=        champion_version,
+        workload_size=         WORKLOAD_SIZE,
+        scale_to_zero_enabled= SCALE_TO_ZERO,
+        name=                  SERVED_ENTITY_NAME,
     )
 
     endpoint_config = EndpointCoreConfigInput(
@@ -169,6 +184,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Check if endpoint exists
+# Decide upfront whether we'll CREATE (no endpoint yet) or UPDATE (endpoint already exists).
 existing_endpoint = None
 
 try:
@@ -190,6 +206,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Create or update
+# Idempotent dispatch: CREATE if absent, UPDATE if a new version is needed, UNCHANGED otherwise.
 try:
     if existing_endpoint is None:
         print(f"Creating endpoint {ENDPOINT_NAME}... (this can take 5-15 minutes)")
@@ -197,28 +214,28 @@ try:
             name=    ENDPOINT_NAME,
             config=  endpoint_config,
             tags=    ENDPOINT_TAGS,
-            timeout= __import__("datetime").timedelta(minutes=READY_TIMEOUT_MIN),
+            timeout= READY_TIMEOUT,
         )
         action = "CREATED"
     else:
         # Detect whether the served version has changed
-        served    = existing_endpoint.config.served_entities if existing_endpoint.config else []
-        same_ver  = (
+        served   = existing_endpoint.config.served_entities if existing_endpoint.config else []
+        same_ver = (
             len(served) == 1
-            and served[0].entity_name    == REGISTERED_MODEL_NAME
+            and served[0].entity_name        == REGISTERED_MODEL_NAME
             and str(served[0].entity_version) == str(champion_version)
         )
 
         if same_ver:
             print(f"Endpoint already serving v{champion_version} — no update needed.")
             endpoint = existing_endpoint
-            action = "UNCHANGED"
+            action   = "UNCHANGED"
         else:
             print(f"Updating endpoint to serve v{champion_version}... (this can take 5-15 minutes)")
             endpoint = workspace_client.serving_endpoints.update_config_and_wait(
-                name=             ENDPOINT_NAME,
-                served_entities=  endpoint_config.served_entities,
-                timeout=          __import__("datetime").timedelta(minutes=READY_TIMEOUT_MIN),
+                name=            ENDPOINT_NAME,
+                served_entities= endpoint_config.served_entities,
+                timeout=         READY_TIMEOUT,
             )
             action = "UPDATED"
 
@@ -235,15 +252,19 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Confirm ready state
+# Re-fetch the endpoint and fail loudly if it isn't fully READY before running the smoke test.
 try:
-    status = workspace_client.serving_endpoints.get(name=ENDPOINT_NAME)
-    ready_state  = status.state.ready  if status.state else None
+    status       = workspace_client.serving_endpoints.get(name=ENDPOINT_NAME)
+    ready_state  = status.state.ready         if status.state else None
     update_state = status.state.config_update if status.state else None
 
     print(f"Ready state:        {ready_state}")
     print(f"Config update:      {update_state}")
 
-    if str(ready_state) != "EndpointStateReady.READY" and "READY" not in str(ready_state):
+    # Extract just the enum value name so we match "READY" exactly,
+    # avoiding the substring trap where "READY" is contained in "NOT_READY".
+    state_name = str(ready_state).rsplit(".", 1)[-1] if ready_state else ""
+    if state_name != "READY":
         raise Exception(
             f"Endpoint {ENDPOINT_NAME} is not READY (state={ready_state}). "
             f"Check the Serving UI for logs."
@@ -260,6 +281,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Load sample rows
+# Pull a handful of rows; drop the target and the excluded features so the payload matches the model schema.
 try:
     sample_pdf = (
         spark.table(FULL_SOURCE)
@@ -268,9 +290,15 @@ try:
     )
     if TARGET_COLUMN in sample_pdf.columns:
         actual_labels = sample_pdf[TARGET_COLUMN].astype(int).tolist()
-        sample_pdf = sample_pdf.drop(columns=[TARGET_COLUMN])
+        sample_pdf    = sample_pdf.drop(columns=[TARGET_COLUMN])
     else:
         actual_labels = None
+
+    # Drop features the model was trained without (would cause schema mismatch).
+    excluded_present = [c for c in EXCLUDED_FEATURES if c in sample_pdf.columns]
+    if excluded_present:
+        sample_pdf = sample_pdf.drop(columns=excluded_present)
+        print(f"Dropped excluded features from payload: {excluded_present}")
 
     print(f"Loaded {len(sample_pdf)} rows for smoke test")
     display(sample_pdf)
@@ -281,11 +309,12 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Query the endpoint
+# Send the sample rows to the live endpoint and compare predictions against actual labels.
 try:
     sample_records = sample_pdf.to_dict(orient="records")
     response = workspace_client.serving_endpoints.query(
-        name=ENDPOINT_NAME,
-        dataframe_records=sample_records,
+        name=              ENDPOINT_NAME,
+        dataframe_records= sample_records,
     )
 
     predictions = response.predictions
@@ -308,6 +337,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Endpoint URL and snippets
+# Build copy-paste curl / Python / SDK snippets for external consumers of the endpoint.
 try:
     invocation_url = f"{workspace_host}/serving-endpoints/{ENDPOINT_NAME}/invocations"
 
@@ -368,6 +398,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Serving summary
+# Final summary block so the run is easy to interpret from the notebook output.
 print("=" * 70)
 print("SERVING ENDPOINT SUMMARY")
 print("=" * 70)
@@ -382,6 +413,5 @@ print("=" * 70)
 print()
 print("NEXT STEPS:")
 print(f"  - Open Catalog Explorer → {REGISTERED_MODEL_NAME} → Serving tab to monitor.")
-print(f"  - When cardioML.py promotes a new @champion, re-run this notebook to update.")
+print(f"  - When ml_promote_cardio_classifier.py promotes a new @champion, re-run this notebook to update.")
 print(f"  - For demo: copy the curl snippet above and run it from any terminal.")
-
