@@ -2,8 +2,9 @@
 # MAGIC %md
 # MAGIC # Cardiovascular Disease — Exploratory Data Analysis
 # MAGIC
-# MAGIC EDA on `pf1.gold.cardiofeatures`. Covers data quality, univariate and bivariate analysis,
-# MAGIC correlations and feature importance ranking by mutual information.
+# MAGIC EDA on `databricks_service_pf.gold.cardio_features`. Covers data quality,
+# MAGIC univariate and bivariate analysis, correlations and feature importance
+# MAGIC ranking by mutual information.
 
 # COMMAND ----------
 
@@ -13,11 +14,13 @@
 # COMMAND ----------
 
 # DBTITLE 1,Catalog
+# Set the active Unity Catalog for all subsequent table references.
 spark.sql("USE CATALOG `databricks_service_pf`")
 
 # COMMAND ----------
 
 # DBTITLE 1,Libraries
+# Data wrangling, plotting and scikit-learn's mutual information for feature ranking.
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -32,16 +35,27 @@ plt.rcParams["grid.alpha"]  = 0.3
 # COMMAND ----------
 
 # DBTITLE 1,Parameters
+# Job-level inputs: source gold feature table to analyse.
 dbutils.widgets.text("source_schema", "gold")
-dbutils.widgets.text("source_table",  "cardiofeatures")
+dbutils.widgets.text("source_table",  "cardio_features")
 
 # COMMAND ----------
 
-# DBTITLE 1,Variables
+# DBTITLE 1,Constants
+# Validate widgets and derive runtime constants (source table, feature roles, labels, colors).
 SOURCE_SCHEMA = dbutils.widgets.get("source_schema")
 SOURCE_TABLE  = dbutils.widgets.get("source_table")
-FULL_SOURCE   = f"{SOURCE_SCHEMA}.{SOURCE_TABLE}"
 
+# Fail fast if any required widget was not provided
+if not all([SOURCE_SCHEMA, SOURCE_TABLE]):
+    raise ValueError(
+        f"Missing required widgets: source_schema='{SOURCE_SCHEMA}', "
+        f"source_table='{SOURCE_TABLE}'"
+    )
+
+FULL_SOURCE = f"{SOURCE_SCHEMA}.{SOURCE_TABLE}"
+
+# Target column and feature roles
 TARGET = "cardio"
 
 CONTINUOUS_FEATURES = [
@@ -57,6 +71,7 @@ CATEGORICAL_FEATURES = [
 # COMMAND ----------
 
 # DBTITLE 1,Variable labels
+# Human-readable labels used in plot titles, axis labels and summary tables.
 VARIABLE_LABELS = {
     "age_years":            "Age (years)",
     "age_group_id":         "Age group",
@@ -79,6 +94,7 @@ VARIABLE_LABELS = {
 # COMMAND ----------
 
 # DBTITLE 1,Color palette
+# Consistent pastel palette reused across every plot in this notebook.
 COLORS = {
     "no_cvd":    "#9DD9BB",   # verde menta pastel
     "cvd":       "#EE9695",   # rojo coral pastel
@@ -100,12 +116,14 @@ CLASS_LEGEND = [
 # COMMAND ----------
 
 # DBTITLE 1,Category labels (loaded from Delta dims)
+# Build a {column → {code → "code - description"}} lookup used by plot/table helpers.
+# Reads gold dimensions for categorical features, hardcodes labels for booleans.
 try:
     DIM_TABLE_MAP = {
-        "age_group_id": ("gold.dimagegroup",    "IdAgeGroup",        "AgeGroupDescription"),
-        "gender":       ("gold.dimgender",      "IdGender",          "GenderDescription"),
-        "cholesterol":  ("gold.dimcholesterol", "IdCholesterolType", "CholesterolTypeDescription"),
-        "gluc":         ("gold.dimglucose",     "IdGlucoseType",     "GlucoseTypeDescription"),
+        "age_group_id": ("gold.dim_age_group",   "IdAgeGroup",        "AgeGroupDescription"),
+        "gender":       ("gold.dim_gender",      "IdGender",          "GenderDescription"),
+        "cholesterol":  ("gold.dim_cholesterol", "IdCholesterolType", "CholesterolTypeDescription"),
+        "gluc":         ("gold.dim_glucose",     "IdGlucoseType",     "GlucoseTypeDescription"),
     }
 
     BOOLEAN_FEATURES = ["hypertension", "is_smoker", "drinks_alcohol", "is_physically_active"]
@@ -139,16 +157,42 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Helper functions
+# Reusable plotting and tabular helpers shared across the EDA cells below.
 def attach_label(df: pd.DataFrame, var_col: str = "variable") -> pd.DataFrame:
-    """Add a human-readable description column based on VARIABLE_LABELS."""
+    """Insert a human-readable description column based on VARIABLE_LABELS.
+
+    Args:
+        df: DataFrame containing a column whose values are variable names.
+        var_col: Name of the column holding the variable names (default "variable").
+
+    Returns:
+        A copy of `df` with a new `description` column inserted at position 1,
+        mapping each variable name to its label from VARIABLE_LABELS. Falls back
+        to the variable name itself when no label is registered.
+    """
     df = df.copy()
     df.insert(1, "description", df[var_col].map(VARIABLE_LABELS).fillna(df[var_col]))
     return df
 
 
-def grid_layout(n_items: int, n_cols: int = 3, fig_w_per_col: float = 5,
-                fig_h_per_row: float = 3.5):
-    """Build a (fig, flat_axes) for a grid of n_items subplots."""
+def grid_layout(
+    n_items: int,
+    n_cols: int = 3,
+    fig_w_per_col: float = 5,
+    fig_h_per_row: float = 3.5,
+) -> tuple:
+    """Build a matplotlib grid sized to fit `n_items` subplots.
+
+    Args:
+        n_items: Number of plots that will be drawn.
+        n_cols: Number of columns in the grid (default 3).
+        fig_w_per_col: Figure width per column in inches.
+        fig_h_per_row: Figure height per row in inches.
+
+    Returns:
+        A (Figure, flat-array-of-Axes) tuple. Unused axes (beyond `n_items`)
+        are turned off so the grid renders cleanly.
+    """
     n_rows    = int(np.ceil(n_items / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols,
                              figsize=(fig_w_per_col * n_cols, fig_h_per_row * n_rows))
@@ -158,7 +202,22 @@ def grid_layout(n_items: int, n_cols: int = 3, fig_w_per_col: float = 5,
     return fig, axes[:n_items]
 
 
-def plot_histogram_grid(df, columns, color, suptitle, n_cols=3):
+def plot_histogram_grid(
+    df: pd.DataFrame,
+    columns: list,
+    color: str,
+    suptitle: str,
+    n_cols: int = 3,
+) -> None:
+    """Plot a grid of histograms — one per column in `columns`.
+
+    Args:
+        df: DataFrame containing the columns to plot.
+        columns: Names of numerical columns to histogram.
+        color: Bar fill color (hex or matplotlib color name).
+        suptitle: Overall figure title.
+        n_cols: Number of columns in the grid.
+    """
     fig, axes = grid_layout(len(columns), n_cols=n_cols)
     for ax, col in zip(axes, columns):
         ax.hist(df[col], bins=40, color=color, edgecolor="white", alpha=0.85)
@@ -168,7 +227,20 @@ def plot_histogram_grid(df, columns, color, suptitle, n_cols=3):
     plt.tight_layout(); plt.show()
 
 
-def plot_boxplot_grid(df, columns, suptitle, n_cols=4):
+def plot_boxplot_grid(
+    df: pd.DataFrame,
+    columns: list,
+    suptitle: str,
+    n_cols: int = 4,
+) -> None:
+    """Plot a grid of boxplots — one per column — useful for outlier detection.
+
+    Args:
+        df: DataFrame containing the columns to plot.
+        columns: Names of numerical columns to box-plot.
+        suptitle: Overall figure title.
+        n_cols: Number of columns in the grid.
+    """
     fig, axes = grid_layout(len(columns), n_cols=n_cols)
     for ax, col in zip(axes, columns):
         ax.boxplot(df[col], patch_artist=True, widths=0.5,
@@ -181,8 +253,25 @@ def plot_boxplot_grid(df, columns, suptitle, n_cols=4):
     plt.tight_layout(); plt.show()
 
 
-def plot_kde_by_class_grid(df, columns, target_col, suptitle, n_cols=3):
-    """KDE plots overlaid by target class — one per continuous variable."""
+def plot_kde_by_class_grid(
+    df: pd.DataFrame,
+    columns: list,
+    target_col: str,
+    suptitle: str,
+    n_cols: int = 3,
+) -> None:
+    """Plot overlaid KDE distributions per target class, one panel per feature.
+
+    Useful for spotting features whose distribution shifts between healthy and
+    diseased populations.
+
+    Args:
+        df: DataFrame containing the features and the target column.
+        columns: Names of continuous features to plot.
+        target_col: Name of the binary target column (0/1).
+        suptitle: Overall figure title.
+        n_cols: Number of columns in the grid.
+    """
     fig, axes = grid_layout(len(columns), n_cols=n_cols)
     for ax, col in zip(axes, columns):
         for cls, color, label in CLASS_LEGEND:
@@ -202,10 +291,27 @@ def plot_kde_by_class_grid(df, columns, target_col, suptitle, n_cols=3):
     plt.tight_layout(); plt.show()
 
 
-def plot_population_pyramid(df, age_col, gender_col,
-                            left_gender_code, right_gender_code,
-                            suptitle):
-    """Horizontal back-to-back bar chart: left gender vs right gender by age group."""
+def plot_population_pyramid(
+    df: pd.DataFrame,
+    age_col: str,
+    gender_col: str,
+    left_gender_code: int,
+    right_gender_code: int,
+    suptitle: str,
+) -> None:
+    """Draw a back-to-back horizontal bar chart by age group and gender.
+
+    The left side shows one gender as negative counts; the right side the
+    other gender as positive counts. Counts are annotated next to each bar.
+
+    Args:
+        df: DataFrame containing the age and gender columns.
+        age_col: Name of the age (or age-group) column used on the y-axis.
+        gender_col: Name of the gender column used to split the bars.
+        left_gender_code: Numeric code for the gender shown on the left.
+        right_gender_code: Numeric code for the gender shown on the right.
+        suptitle: Plot title.
+    """
     pyramid = (
         df.groupby([age_col, gender_col], observed=True)
           .size()
@@ -255,9 +361,27 @@ def plot_population_pyramid(df, age_col, gender_col,
     plt.tight_layout(); plt.show()
 
 
-def plot_pair_top_features(df, columns, target_col, sample_size, suptitle):
-    """Pair plot of the top features colored by target class, on a random sample."""
-    sample = df.sample(min(sample_size, len(df)), random_state=42)
+def plot_pair_top_features(
+    df: pd.DataFrame,
+    columns: list,
+    target_col: str,
+    sample_size: int,
+    suptitle: str,
+) -> None:
+    """Draw a seaborn pair plot of the top features, colored by target class.
+
+    The pair plot is drawn on a random sample to keep rendering tractable.
+    Axis labels are rewritten with human-readable names and legend entries
+    are translated from class codes to "No CVD" / "CVD".
+
+    Args:
+        df: DataFrame containing the features and the target column.
+        columns: Names of the feature columns to include in the pair plot.
+        target_col: Name of the binary target column used for hue.
+        sample_size: Maximum number of rows to sample for plotting.
+        suptitle: Plot title.
+    """
+    sample  = df.sample(min(sample_size, len(df)), random_state=42)
     palette = {cls: color for cls, color, _ in CLASS_LEGEND}
 
     grid = sns.pairplot(
@@ -291,9 +415,25 @@ def plot_pair_top_features(df, columns, target_col, sample_size, suptitle):
     plt.show()
 
 
-def plot_categorical_grid(df, columns, suptitle, mode="count",
-                          target_col=None, n_cols=4):
-    """mode: 'count' shows frequency bars; 'target_rate' shows mean target by category."""
+def plot_categorical_grid(
+    df: pd.DataFrame,
+    columns: list,
+    suptitle: str,
+    mode: str = "count",
+    target_col: str = None,
+    n_cols: int = 4,
+) -> None:
+    """Plot a grid of categorical bar charts — either frequencies or target rate.
+
+    Args:
+        df: DataFrame containing the categorical columns and (if applicable) target.
+        columns: Names of categorical columns to plot.
+        suptitle: Overall figure title.
+        mode: "count" → plot frequency bars; "target_rate" → plot mean target per
+            category (and overlay the global mean as a dashed line).
+        target_col: Required when `mode="target_rate"`; ignored otherwise.
+        n_cols: Number of columns in the grid.
+    """
     fig, axes = grid_layout(len(columns), n_cols=n_cols)
     overall_rate = df[target_col].mean() if mode == "target_rate" else None
     total_rows   = len(df) if mode == "count" else None
@@ -342,6 +482,7 @@ def plot_categorical_grid(df, columns, suptitle, mode="count",
 # COMMAND ----------
 
 # DBTITLE 1,Step 1 — Initial load
+# Pull the feature table into pandas — 70k rows fit comfortably in driver memory.
 try:
     cardio_spark   = spark.table(FULL_SOURCE)
     cardio_df      = cardio_spark.toPandas()
@@ -357,6 +498,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 2 — Dataset structure
+# Tag every column with its role (target / continuous / categorical) and summarise the inventory.
 try:
     dataset_structure = pd.DataFrame({
         "variable": cardio_df.columns,
@@ -392,6 +534,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 3 — Data quality
+# Null counts, uniqueness, constants and duplicates — sanity checks before analysis.
 try:
     quality_report = pd.DataFrame({
         "variable":  cardio_df.columns,
@@ -422,6 +565,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 4 — Target distribution
+# Inspect class balance for the binary target before univariate / bivariate work.
 try:
     target_distribution = (
         cardio_df[TARGET].value_counts()
@@ -463,6 +607,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 5 — Continuous variables (stats)
+# Descriptive statistics (count, mean, std, min/quartiles/max) for each continuous feature.
 try:
     continuous_stats = (
         cardio_df[CONTINUOUS_FEATURES]
@@ -481,6 +626,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 5 — Continuous variables (histograms)
+# Inspect the marginal distribution shape of each continuous feature.
 try:
     plot_histogram_grid(
         cardio_df, CONTINUOUS_FEATURES,
@@ -494,6 +640,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 5 — Continuous variables (boxplots)
+# Detect outliers visually via IQR-based boxplots per continuous feature.
 try:
     plot_boxplot_grid(
         cardio_df, CONTINUOUS_FEATURES,
@@ -506,6 +653,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 5 — Continuous variables (KDE by class)
+# Spot features whose distribution shifts between CVD and No-CVD patients.
 try:
     plot_kde_by_class_grid(
         cardio_df, CONTINUOUS_FEATURES, TARGET,
@@ -523,6 +671,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 6 — Categorical variables (cardinality and mode)
+# Summarise cardinality, mode value and mode share for every categorical feature.
 try:
     categorical_summary_rows = []
     for col in CATEGORICAL_FEATURES:
@@ -549,6 +698,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 6 — Categorical variables (frequencies)
+# Frequency bars (with counts and percentages) for each categorical feature.
 try:
     plot_categorical_grid(
         cardio_df, CATEGORICAL_FEATURES,
@@ -562,6 +712,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 6 — Population pyramid (age × gender)
+# Visualise the joint age-gender distribution of the patient cohort.
 try:
     GENDER_FEMALE_CODE = 1
     GENDER_MALE_CODE   = 2
@@ -586,6 +737,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 7 — CVD rate by category
+# CVD rate per category vs the global mean — identifies high-risk groups.
 try:
     plot_categorical_grid(
         cardio_df, CATEGORICAL_FEATURES,
@@ -599,6 +751,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 8 — Correlation matrix (Spearman)
+# Spearman correlation across all features and target — captures monotonic (not just linear) relationships.
 try:
     correlation_features = CONTINUOUS_FEATURES + CATEGORICAL_FEATURES + [TARGET]
     correlation_matrix   = cardio_df[correlation_features].corr(method="spearman")
@@ -626,6 +779,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 9 — Mutual information ranking
+# Non-parametric feature importance — captures non-linear dependencies missed by correlation.
 try:
     feature_columns = CONTINUOUS_FEATURES + CATEGORICAL_FEATURES
     X_for_mi        = cardio_df[feature_columns]
@@ -664,6 +818,7 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Step 10 — Pair plot of top features
+# Joint scatter + KDE diagonals on a sample, coloured by class — sanity check before modelling.
 try:
     TOP_N_FEATURES   = 5
     PAIRPLOT_SAMPLE  = 5_000
