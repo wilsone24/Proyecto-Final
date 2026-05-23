@@ -10,3 +10,4 @@ targets:
     default: true
     workspace:
       host: https://adb-7405609053978389.9.azuredatabricks.net
+      root_path: /Workspace/Users/wilsone@uninorte.edu.co/.bundle/${bundle.name}/${bundle.target}
